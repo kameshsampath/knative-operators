@@ -9,9 +9,6 @@ KNATIVE_SERVING_VERSION=v0.4.1
 KNATIVE_BUILD_VERSION=v0.4.0
 KNATIVE_EVENTING_VERSION=v0.4.1
 
-readonly ISTIO_IMAGE_REPO="docker.io/istio/"
-readonly ISTIO_PATCH_VERSION="1.0.7"
-
 INSTALL_SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" >/dev/null && pwd )"
 
 CMD=kubectl
@@ -196,75 +193,8 @@ function install_catalogsources {
   $CMD apply -n "$OLM_NS" -f https://raw.githubusercontent.com/openshift/knative-serving/release-v0.4.1/openshift/olm/knative-serving.catalogsource.yaml
   $CMD apply -n "$OLM_NS" -f https://raw.githubusercontent.com/openshift/knative-build/release-v0.4.0/openshift/olm/knative-build.catalogsource.yaml
   $CMD apply -n "$OLM_NS" -f https://raw.githubusercontent.com/openshift/knative-eventing/release-v0.4.1/openshift/olm/knative-eventing.catalogsource.yaml
-  $CMD apply -f "$ROOT_DIR/maistra-operators.catalogsource.yaml" -n "$OLM_NS"
   timeout 120 "$CMD get pods -n $OLM_NS | grep knative"
-  timeout 120 "$CMD get pods -n $OLM_NS | grep maistra"
   wait_for_all_pods "$OLM_NS"
-}
-
-function install_istio {
-  if $CMD get ns "istio-system" 2>/dev/null; then
-    echo "Detected istio - skipping installation"
-  elif check_minikube; then
-    echo "Detected minikube - incompatible with Maistra operator, so installing upstream istio."
-    $CMD apply -f "https://github.com/knative/serving/releases/download/${KNATIVE_SERVING_VERSION}/istio-crds.yaml" && \
-    $CMD apply -f "https://github.com/knative/serving/releases/download/${KNATIVE_SERVING_VERSION}/istio.yaml"
-    wait_for_all_pods istio-system
-  else
-    $CMD create ns istio-operator
-    if check_operatorgroups; then
-      cat <<-EOF | $CMD apply -f -
-	apiVersion: operators.coreos.com/v1
-	kind: OperatorGroup
-	metadata:
-	  name: istio-operator
-	  namespace: istio-operator
-	EOF
-    fi
-    cat <<-EOF | $CMD apply -f -
-	apiVersion: operators.coreos.com/v1alpha1
-	kind: Subscription
-	metadata:
-	  name: maistra
-	  namespace: istio-operator
-	spec:
-	  channel: alpha
-	  name: maistra
-	  source: maistra-operators
-	  sourceNamespace: $(olm_namespace)
-	EOF
-    wait_for_all_pods istio-operator
-
-    cat <<-EOF | $CMD apply -f -
-	apiVersion: istio.openshift.com/v1alpha1
-	kind: Installation
-	metadata:
-	  namespace: istio-operator
-	  name: istio-installation
-	spec:
-	  istio:
-	    authentication: false
-	    community: true
-	  kiali:
-	    username: admin
-	    password: admin
-	    prefix: kiali/
-	EOF
-    timeout 900 '$CMD get pods -n istio-system && [[ $($CMD get pods -n istio-system | grep openshift-ansible-istio-installer | grep -c Completed) -gt 0 ]]'
-
-    # Scale down unused services deployed by the istio operator. The
-    # jaeger pods will fail anyway due to the elasticsearch pod failing
-    # due to "max virtual memory areas vm.max_map_count [65530] is too
-    # low, increase to at least [262144]" which could be mitigated on
-    # minishift with:
-    #  minishift ssh "echo 'echo vm.max_map_count = 262144 >/etc/sysctl.d/99-elasticsearch.conf' | sudo sh"
-    $CMD scale -n istio-system --replicas=0 deployment/grafana
-    $CMD scale -n istio-system --replicas=0 deployment/jaeger-collector
-    $CMD scale -n istio-system --replicas=0 deployment/jaeger-query
-    $CMD scale -n istio-system --replicas=0 statefulset/elasticsearch
-
-    patch_istio_for_knative
-  fi
 }
 
 function install_knative {
@@ -332,43 +262,11 @@ function enable_interaction_with_registry() {
   fi
 }
 
-function patch_istio_for_knative() {
-  local sidecar_config=$($CMD get configmap -n istio-system istio-sidecar-injector -o yaml)
-  if [[ -z "${sidecar_config}" ]]; then
-    return 1
-  fi
-  echo "${sidecar_config}" | grep lifecycle
-  if [[ $? -eq 1 ]]; then
-    echo "Patching Istio's preStop hook for graceful shutdown"
-    echo "${sidecar_config}" | sed 's/\(name: istio-proxy\)/\1\\n    lifecycle:\\n      preStop:\\n        exec:\\n          command: [\\"sh\\", \\"-c\\", \\"sleep 20; while [ $(netstat -plunt | grep tcp | grep -v envoy | wc -l | xargs) -ne 0 ]; do sleep 1; done\\"]/' | $CMD replace -f -
-    $CMD delete pod -n istio-system -l istio=sidecar-injector
-    wait_for_all_pods istio-system
-  fi
-
-  # Patch the sidecar injector configmap up to $ISTIO_PATCH_VERSION
-  oc get -n istio-system configmap/istio-sidecar-injector -o yaml | sed "s/:1.0.[[:digit:]]\+/:${ISTIO_PATCH_VERSION}/g" | oc replace -f -
-
-  # Ensure Istio $ISTIO_PATCH_VERSION is used everywhere
-  echo "Patching Istio images up to $ISTIO_PATCH_VERSION"
-  patch_istio_deployment istio-galley 0 galley || return 1
-  patch_istio_deployment istio-egressgateway 0 proxyv2 || return 1
-  patch_istio_deployment istio-ingressgateway 0 proxyv2 || return 1
-  patch_istio_deployment istio-policy 0 mixer || return 1
-  patch_istio_deployment istio-policy 1 proxyv2 || return 1
-  patch_istio_deployment istio-telemetry 0 mixer || return 1
-  patch_istio_deployment istio-telemetry 1 proxyv2 || return 1
-  patch_istio_deployment istio-pilot 0 pilot || return 1
-  patch_istio_deployment istio-pilot 1 proxyv2 || return 1
-  patch_istio_deployment istio-citadel 0 citadel || return 1
-  patch_istio_deployment istio-sidecar-injector 0 sidecar_injector || return 1
-
-  wait_for_deployment istio-system istio-galley
-  wait_for_all_pods istio-system || return 1
-}
-
-function patch_istio_deployment() {
-  local deployment="$1"
-  local containerIndex=$2
-  local imageName=$3
-  oc patch -n istio-system deployment/${deployment} --type json -p "[{\"op\": \"replace\", \"path\": \"/spec/template/spec/containers/${containerIndex}/image\", \"value\":\"${ISTIO_IMAGE_REPO}${imageName}:${ISTIO_PATCH_VERSION}\"}]"
+# Added to make the Knative routes  use OpenShift Router for URLS
+# https://github.com/bbrowning/knative-openshift-ingress
+function install_openshift_route_operator() {
+   if check_openshift_4; then
+     echo "Installing Knative OpenShift Ingress Operator"
+     oc apply --filename https://github.com/bbrowning/knative-openshift-ingress/releases/download/v0.0.1/release.yaml
+   fi
 }

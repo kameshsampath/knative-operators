@@ -27,7 +27,6 @@ source "$DIR/installation-functions.sh"
 enable_admission_webhooks
 install_olm
 install_catalogsources
-install_istio
 install_knative build
 install_knative serving
 install_knative eventing
@@ -40,6 +39,8 @@ wait_for_deployment knative-eventing eventing-controller
 wait_for_all_pods knative-eventing
 
 enable_interaction_with_registry
+install_openshift_route_operator
+wait_for_all_pods knative-serving
 
 # skip tag resolving for internal registry
 # OpenShift 3 and 4 place the registry in different locations, hence
